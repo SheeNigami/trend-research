@@ -1,0 +1,8 @@
+# One Instagram profile per line.
+# Use usernames only (with or without @).
+
+# Example:
+
+# @natgeo
+# openai
+

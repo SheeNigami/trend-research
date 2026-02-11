@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local credentials and scraper state
+.secrets/
+.state/
+.env
+
+# Downloaded Instagram media
+data/

@@ -1,0 +1,7 @@
+# One Instagram reel/post URL (or shortcode) per line.
+# These are useful for ad-hoc downloads in addition to profile sync.
+
+# Example:
+# https://www.instagram.com/reel/Cx123456789/
+# Cx123456789
+
