@@ -1448,13 +1448,20 @@ def command_enrich_media(args: argparse.Namespace) -> None:
         relative_media = media_path.relative_to(media_root)
         output_dir = output_root / relative_media.parent
         base_name = media_path.stem
-        analysis_path = output_dir / f"{base_name}.analysis.json"
-        transcript_json_path = output_dir / f"{base_name}.transcript.json"
-        transcript_txt_path = output_dir / f"{base_name}.transcript.txt"
-        ocr_txt_path = output_dir / f"{base_name}.ocr.txt"
+        media_type = "video" if is_video_file(media_path) else "image"
+        # Images and videos often share the same stem (e.g., reel thumbnail .jpg + reel video .mp4).
+        # Keep existing image naming, but disambiguate video analysis/transcript/ocr outputs.
+        analysis_stem = base_name if media_type == "image" else f"{base_name}__video"
+        analysis_path = output_dir / f"{analysis_stem}.analysis.json"
+        transcript_json_path = output_dir / f"{analysis_stem}.transcript.json"
+        transcript_txt_path = output_dir / f"{analysis_stem}.transcript.txt"
+        ocr_txt_path = output_dir / f"{analysis_stem}.ocr.txt"
 
         if analysis_path.exists() and not args.overwrite:
             skipped += 1
+            existing = maybe_read_json(analysis_path)
+            if isinstance(existing, dict):
+                records.append(existing)
             continue
 
         metadata, metadata_path = load_post_metadata(media_path)
@@ -1462,7 +1469,6 @@ def command_enrich_media(args: argparse.Namespace) -> None:
         caption_text = extract_caption(node)
         hashtags = sorted(set(HASHTAG_RE.findall(caption_text)))
         mentions = sorted(set(MENTION_RE.findall(caption_text)))
-        media_type = "video" if is_video_file(media_path) else "image"
         audio_probe = probe_audio_stream(media_path) if media_type == "video" else None
 
         record: dict[str, Any] = {
@@ -1471,6 +1477,7 @@ def command_enrich_media(args: argparse.Namespace) -> None:
             "media_type": media_type,
             "downloaded_file": media_path.name,
             "source_metadata_file": str(metadata_path) if metadata_path else None,
+            "analysis_stem": analysis_stem,
             "post": {
                 "shortcode": node.get("shortcode"),
                 "id": node.get("id"),
@@ -1965,7 +1972,7 @@ def create_cli() -> argparse.ArgumentParser:
     enrich_parser.add_argument(
         "--video-ocr-interval-seconds",
         type=float,
-        default=2.5,
+        default=5.0,
         help="How often to sample frames from videos for OCR.",
     )
     enrich_parser.add_argument(
@@ -2036,7 +2043,7 @@ def create_cli() -> argparse.ArgumentParser:
     run_following_parser.add_argument(
         "--video-ocr-interval-seconds",
         type=float,
-        default=2.5,
+        default=5.0,
         help="How often to sample frames from videos for OCR.",
     )
     run_following_parser.add_argument(
