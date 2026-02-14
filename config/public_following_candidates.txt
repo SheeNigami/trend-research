@@ -1,0 +1,7 @@
+# Public candidate profiles for no-login scraping mode.
+# One username or Instagram profile URL per line.
+#
+# Notes:
+# - The seed profile is always included automatically.
+# - Private profiles are auto-skipped.
+# - Keep this list to accounts you want to monitor.

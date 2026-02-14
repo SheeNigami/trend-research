@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import lzma
 import os
+import pickle
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,6 +25,7 @@ BARE_SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,}$")
 PROFILE_RE = re.compile(
     r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9._-]+)/?(?:\?.*)?$"
 )
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 MENTION_RE = re.compile(r"@([A-Za-z0-9._]+)")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
@@ -29,11 +33,24 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 def ensure_instaloader_cli() -> None:
+    resolve_instaloader_cmd()
+
+
+def resolve_instaloader_cmd() -> list[str]:
+    configured = os.getenv("IG_INSTALOADER_BIN")
+    if configured:
+        parsed = shlex.split(configured)
+        if parsed:
+            return parsed
     if shutil.which("instaloader"):
-        return
-    raise SystemExit(
-        "Instaloader CLI not found. Install deps with: pip install -r requirements.txt"
-    )
+        return ["instaloader"]
+    try:
+        __import__("instaloader")
+    except ImportError as exc:
+        raise SystemExit(
+            "Instaloader CLI not found. Install deps with: pip install -r requirements.txt"
+        ) from exc
+    return [sys.executable, "-m", "instaloader"]
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -58,6 +75,464 @@ def env_float(name: str, fallback: float) -> float:
         return float(value)
     except ValueError:
         return fallback
+
+
+def env_int(name: str, fallback: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return fallback
+    try:
+        return int(value)
+    except ValueError:
+        return fallback
+
+
+def cookie_preview(value: Any, *, keep: int = 4) -> str:
+    if not isinstance(value, str):
+        return "<missing>"
+    if not value:
+        return "<empty>"
+    if len(value) <= keep * 2:
+        return value
+    return f"{value[:keep]}...{value[-keep:]}"
+
+
+def load_session_cookie_dict(session_file: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not session_file.exists():
+        return None, f"session file does not exist: {session_file}"
+    try:
+        loaded = pickle.loads(session_file.read_bytes())
+    except Exception as exc:
+        return None, f"failed to read session file: {exc}"
+    if not isinstance(loaded, dict):
+        return None, "session file payload is not a cookie dict"
+    return loaded, None
+
+
+def session_has_non_empty_sessionid(session_file: Path) -> tuple[bool, str]:
+    cookies, err = load_session_cookie_dict(session_file)
+    if cookies is None:
+        return False, err or "unknown session read error"
+    sessionid = cookies.get("sessionid")
+    if not isinstance(sessionid, str) or not sessionid.strip():
+        return False, "sessionid missing/empty in session cookie file"
+    return True, "ok"
+
+
+def warn_if_session_lacks_sessionid(username: str | None, session_file: Path | None) -> None:
+    if not username or not session_file:
+        return
+    ok, reason = session_has_non_empty_sessionid(session_file)
+    if ok:
+        return
+    print(
+        "Warning: authenticated mode may fail because current session file is invalid "
+        f"({reason}). To refresh from browser cookies, run:\n"
+        f"  python scripts/ig_pipeline.py session-from-browser --username {username}"
+    )
+
+
+def ensure_browser_cookie3_installed() -> None:
+    if importlib.util.find_spec("browser_cookie3") is not None:
+        return
+    raise SystemExit(
+        "browser_cookie3 is required for session-from-browser.\n"
+        "Install with: pip install 'instaloader[browser-cookie3]'"
+    )
+
+
+def available_browser_cookie_sources() -> dict[str, Any]:
+    ensure_browser_cookie3_installed()
+    import browser_cookie3
+
+    candidates = {
+        "arc": "arc",
+        "brave": "brave",
+        "chrome": "chrome",
+        "chromium": "chromium",
+        "edge": "edge",
+        "firefox": "firefox",
+        "librewolf": "librewolf",
+        "opera": "opera",
+        "safari": "safari",
+        "vivaldi": "vivaldi",
+    }
+    out: dict[str, Any] = {}
+    for key, attr in candidates.items():
+        fn = getattr(browser_cookie3, attr, None)
+        if callable(fn):
+            out[key] = fn
+    return out
+
+
+def load_instagram_cookies_from_browser(browser: str) -> dict[str, str]:
+    lookup = available_browser_cookie_sources()
+    key = browser.strip().lower()
+    loader = lookup.get(key)
+    if loader is None:
+        supported = ", ".join(sorted(lookup.keys()))
+        raise SystemExit(
+            f"Unsupported --browser value: {browser!r}. Supported values: {supported}"
+        )
+    try:
+        jar = loader(domain_name="instagram.com")
+    except Exception as exc:
+        raise SystemExit(f"Failed to read Instagram cookies from {browser}: {exc}") from exc
+
+    cookies: dict[str, str] = {}
+    for cookie in jar:
+        if "instagram.com" not in cookie.domain:
+            continue
+        if not cookie.name:
+            continue
+        cookies[cookie.name] = cookie.value
+    return cookies
+
+
+def import_instaloader():
+    try:
+        import instaloader
+    except ImportError as exc:
+        raise SystemExit(
+            "Instaloader Python package not found. Install deps with: pip install -r requirements.txt"
+        ) from exc
+    return instaloader
+
+
+def build_programmatic_loader(
+    *,
+    dirname_pattern: str,
+    quiet: bool,
+    username: str | None,
+    session_file: Path | None,
+    abort_on_401: bool,
+):
+    instaloader = import_instaloader()
+    fatal_status_codes = [401] if abort_on_401 else None
+    loader = instaloader.Instaloader(
+        dirname_pattern=dirname_pattern,
+        filename_pattern="{date_utc}_UTC",
+        sanitize_paths=True,
+        quiet=quiet,
+        fatal_status_codes=fatal_status_codes,
+    )
+    if username:
+        if not session_file:
+            raise SystemExit("session file is required for logged-in programmatic mode")
+        if not session_file.exists():
+            raise SystemExit(
+                f"Session file not found at {session_file}. "
+                f"Run: python scripts/ig_pipeline.py session-from-browser --username {username}"
+            )
+        loader.load_session_from_file(username, str(session_file))
+        logged_in = loader.test_login()
+        if logged_in != username:
+            raise SystemExit(
+                "Session is not valid for logged-in scraping. "
+                f"Expected {username!r}, got {logged_in!r}. Run session-from-browser to refresh."
+            )
+    return loader
+
+
+def run_with_retry(
+    fn: Any,
+    *,
+    retries: int,
+    retry_wait_seconds: float,
+    retry_backoff: float,
+) -> None:
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            fn()
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if attempt == attempts:
+                raise SystemExit(
+                    f"Instaloader programmatic sync failed after {attempts} attempts: {exc}"
+                ) from exc
+            wait_seconds = max(1.0, retry_wait_seconds) * (
+                max(1.0, retry_backoff) ** (attempt - 1)
+            )
+            wait_label = f"{wait_seconds:.1f}".rstrip("0").rstrip(".")
+            print(
+                f"Programmatic sync failed ({exc}). "
+                f"Retrying in {wait_label}s (attempt {attempt + 1}/{attempts})..."
+            )
+            time.sleep(wait_seconds)
+
+
+def resolve_followee_usernames(
+    *,
+    seed_profile: str,
+    username: str,
+    session_file: Path,
+    quiet: bool,
+    abort_on_401: bool,
+    retries: int,
+    retry_wait_seconds: float,
+    retry_backoff: float,
+) -> list[str]:
+    usernames: list[str] = []
+
+    def _load() -> None:
+        nonlocal usernames
+        loader = build_programmatic_loader(
+            dirname_pattern=str(Path("data") / "{target}"),
+            quiet=quiet,
+            username=username,
+            session_file=session_file,
+            abort_on_401=abort_on_401,
+        )
+        instaloader = import_instaloader()
+        profile = instaloader.Profile.from_username(loader.context, seed_profile)
+        usernames = [followee.username for followee in profile.get_followees()]
+
+    run_with_retry(
+        _load,
+        retries=retries,
+        retry_wait_seconds=retry_wait_seconds,
+        retry_backoff=retry_backoff,
+    )
+    return usernames
+
+
+def download_profiles_with_age_cutoff(
+    *,
+    target_usernames: list[str],
+    download_root: Path,
+    latest_stamps_file: Path,
+    max_age_days: float,
+    reels_only: bool,
+    fast_update: bool,
+    possibly_pinned: int,
+    min_old_posts_before_stop: int,
+    username: str | None,
+    session_file: Path | None,
+    quiet: bool,
+    abort_on_401: bool,
+    retries: int,
+    retry_wait_seconds: float,
+    retry_backoff: float,
+) -> None:
+    if not target_usernames:
+        print("No target profiles to sync.")
+        return
+    latest_stamps_file.parent.mkdir(parents=True, exist_ok=True)
+    min_dt_utc = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    if possibly_pinned < 0:
+        raise SystemExit("--possibly-pinned must be >= 0.")
+    if min_old_posts_before_stop < 0:
+        raise SystemExit("--min-old-posts-before-stop must be >= 0.")
+
+    def _run() -> None:
+        loader = build_programmatic_loader(
+            dirname_pattern=str(download_root / "{target}"),
+            quiet=quiet,
+            username=username,
+            session_file=session_file,
+            abort_on_401=abort_on_401,
+        )
+        instaloader = import_instaloader()
+        from instaloader.lateststamps import LatestStamps
+
+        latest_stamps = LatestStamps(str(latest_stamps_file))
+        profiles: list[Any] = []
+        skipped: list[tuple[str, str]] = []
+        for handle in target_usernames:
+            try:
+                profile = instaloader.Profile.from_username(loader.context, handle)
+            except instaloader.exceptions.ProfileNotExistsException:
+                skipped.append((handle, "profile not found"))
+                continue
+            except instaloader.exceptions.PrivateProfileNotFollowedException:
+                skipped.append((handle, "private profile"))
+                continue
+            except instaloader.exceptions.LoginRequiredException:
+                skipped.append((handle, "login required"))
+                continue
+            profiles.append(profile)
+            latest_stamps.save_profile_id(profile.username, profile.userid)
+            if latest_stamps.get_last_reels_timestamp(profile.username) < min_dt_utc:
+                latest_stamps.set_last_reels_timestamp(profile.username, min_dt_utc)
+            if not reels_only and latest_stamps.get_last_post_timestamp(profile.username) < min_dt_utc:
+                latest_stamps.set_last_post_timestamp(profile.username, min_dt_utc)
+
+        for handle, reason in skipped:
+            print(f"Skipping {handle!r}: {reason}.")
+        if not profiles:
+            print("No downloadable profiles after filtering.")
+            return
+        profiles_sorted = sorted(profiles, key=lambda p: p.username)
+        display_names = " ".join(p.username for p in profiles_sorted)
+        print(f"Downloading {len(profiles_sorted)} profiles: {display_names}")
+
+        def to_utc(dt: datetime) -> datetime:
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+        def iter_post_stream(
+            posts_iter: Iterable[Any],
+            *,
+            profile_username: str,
+            kind: str,
+            stop_cutoff_utc: datetime,
+        ) -> tuple[int, int, int, datetime | None]:
+            """
+            Iterate a post stream (reels/posts) newest->oldest and download items newer than stop_cutoff_utc.
+            Logs per-item progress so the console shows download/skip decisions.
+
+            Returns: (downloaded, already_present, skipped_old, newest_seen_utc)
+            """
+            downloaded = 0
+            already_present = 0
+            skipped_old = 0
+            newest_present_utc: datetime | None = None
+
+            seen = 0
+            old_streak = 0
+
+            for post in posts_iter:
+                seen += 1
+                dt = getattr(post, "date_utc", None) or getattr(post, "date_local", None)
+                dt_utc = to_utc(dt) if isinstance(dt, datetime) else None
+
+                # For age-based cutoff, treat strictly older-than cutoff as old.
+                # This avoids "equal timestamp" edge cases and matches user expectation:
+                # "download anything within the window".
+                is_old = dt_utc is not None and dt_utc < stop_cutoff_utc
+
+                # Don't let pinned/out-of-order content cause early stop.
+                if seen <= possibly_pinned:
+                    if is_old:
+                        skipped_old += 1
+                        if not quiet:
+                            sc = getattr(post, "shortcode", "?")
+                            print(
+                                f"[{seen:3}] {profile_username} {kind} {sc} skipped (old/pinned)"
+                                f"{' ' + dt_utc.isoformat() if dt_utc else ''}"
+                            )
+                        continue
+                    # New enough, attempt download.
+                    ok = loader.download_post(post, target=profile_username)
+                    if ok:
+                        downloaded += 1
+                        status = "downloaded"
+                    else:
+                        already_present += 1
+                        status = "exists"
+                    if dt_utc is not None:
+                        newest_present_utc = (
+                            dt_utc
+                            if newest_present_utc is None
+                            else max(newest_present_utc, dt_utc)
+                        )
+                    if not quiet:
+                        sc = getattr(post, "shortcode", "?")
+                        print(
+                            f"[{seen:3}] {profile_username} {kind} {sc} {status}"
+                            f"{' ' + dt_utc.isoformat() if dt_utc else ''}"
+                        )
+                    continue
+
+                if is_old:
+                    skipped_old += 1
+                    old_streak += 1
+                    if not quiet:
+                        sc = getattr(post, "shortcode", "?")
+                        print(
+                            f"[{seen:3}] {profile_username} {kind} {sc} skipped (old)"
+                            f"{' ' + dt_utc.isoformat() if dt_utc else ''}"
+                        )
+                    if min_old_posts_before_stop == 0 or old_streak >= min_old_posts_before_stop:
+                        if not quiet:
+                            print(
+                                f"Stop: {profile_username} {kind} reached cutoff after "
+                                f"{old_streak} consecutive old posts."
+                            )
+                        break
+                    continue
+
+                old_streak = 0
+                ok = loader.download_post(post, target=profile_username)
+                if ok:
+                    downloaded += 1
+                    status = "downloaded"
+                else:
+                    already_present += 1
+                    status = "exists"
+                    # Optional "fast update": stop once we hit already-downloaded content in the main stream.
+                    if fast_update:
+                        if not quiet:
+                            sc = getattr(post, "shortcode", "?")
+                            print(
+                                f"[{seen:3}] {profile_username} {kind} {sc} exists; fast-update stop."
+                            )
+                        break
+                if dt_utc is not None:
+                    newest_present_utc = (
+                        dt_utc if newest_present_utc is None else max(newest_present_utc, dt_utc)
+                    )
+                if not quiet and not (fast_update and status == "exists"):
+                    sc = getattr(post, "shortcode", "?")
+                    print(
+                        f"[{seen:3}] {profile_username} {kind} {sc} {status}"
+                        f"{' ' + dt_utc.isoformat() if dt_utc else ''}"
+                    )
+
+            return downloaded, already_present, skipped_old, newest_present_utc
+
+        for profile in profiles_sorted:
+            # Reels
+            loader.context.log(f"Retrieving reels videos for profile {profile.username}.")
+            last_reels = latest_stamps.get_last_reels_timestamp(profile.username)
+            # Important: stopping/skipping is based on age cutoff only.
+            # LatestStamps can get ahead of reality (e.g., partial/aborted runs), and using it
+            # as a hard cutoff can cause "skipped everything" even when content is recent.
+            stop_cutoff_reels = min_dt_utc
+            reels_downloaded, reels_exists, reels_skipped, reels_newest = iter_post_stream(
+                profile.get_reels(),
+                profile_username=profile.username,
+                kind="reels",
+                stop_cutoff_utc=stop_cutoff_reels,
+            )
+            if reels_newest is not None and reels_newest > to_utc(last_reels):
+                latest_stamps.set_last_reels_timestamp(profile.username, reels_newest)
+            if not quiet:
+                print(
+                    f"Summary: {profile.username} reels downloaded={reels_downloaded}, "
+                    f"exists={reels_exists}, skipped_old={reels_skipped}"
+                )
+
+            # Posts (optional)
+            if reels_only:
+                continue
+            loader.context.log(f"Retrieving posts from profile {profile.username}.")
+            last_posts = latest_stamps.get_last_post_timestamp(profile.username)
+            stop_cutoff_posts = min_dt_utc
+            posts_downloaded, posts_exists, posts_skipped, posts_newest = iter_post_stream(
+                profile.get_posts(),
+                profile_username=profile.username,
+                kind="posts",
+                stop_cutoff_utc=stop_cutoff_posts,
+            )
+            if posts_newest is not None and posts_newest > to_utc(last_posts):
+                latest_stamps.set_last_post_timestamp(profile.username, posts_newest)
+            if not quiet:
+                print(
+                    f"Summary: {profile.username} posts downloaded={posts_downloaded}, "
+                    f"exists={posts_exists}, skipped_old={posts_skipped}"
+                )
+
+    run_with_retry(
+        _run,
+        retries=retries,
+        retry_wait_seconds=retry_wait_seconds,
+        retry_backoff=retry_backoff,
+    )
 
 
 def read_non_comment_lines(path: Path) -> list[str]:
@@ -92,6 +567,81 @@ def normalize_profile(value: str) -> str:
     if match:
         cleaned = match.group(1)
     return cleaned.lstrip("@").strip()
+
+
+def is_valid_username(value: str) -> bool:
+    return bool(USERNAME_RE.fullmatch(value))
+
+
+def collect_public_candidates(seed_profile: str, candidates_file: Path) -> tuple[list[str], list[str]]:
+    candidates: list[str] = []
+    invalid: list[str] = []
+    seen: set[str] = set()
+
+    def push(raw: str) -> None:
+        normalized = normalize_profile(raw)
+        if not normalized:
+            return
+        if not is_valid_username(normalized):
+            invalid.append(raw)
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    push(seed_profile)
+    for line in read_non_comment_lines(candidates_file):
+        push(line)
+    return candidates, invalid
+
+
+def classify_public_candidates(candidates: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    if not candidates:
+        return [], []
+    try:
+        import instaloader
+    except ImportError:
+        return candidates, []
+
+    loader = instaloader.Instaloader(
+        quiet=True,
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+    )
+    public: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for username in candidates:
+        try:
+            profile = instaloader.Profile.from_username(loader.context, username)
+        except instaloader.exceptions.ProfileNotExistsException:
+            skipped.append((username, "profile not found"))
+            continue
+        except instaloader.exceptions.PrivateProfileNotFollowedException:
+            skipped.append((username, "private profile"))
+            continue
+        except instaloader.exceptions.LoginRequiredException:
+            public.append(username)
+            skipped.append((username, "could not inspect anonymously; attempting download"))
+            continue
+        except instaloader.exceptions.TooManyRequestsException:
+            # If visibility probing gets throttled, keep the candidate and let download attempt decide.
+            public.append(username)
+            continue
+        except instaloader.exceptions.InstaloaderException as exc:
+            public.append(username)
+            skipped.append((username, f"visibility check error: {exc}"))
+            continue
+        if profile.is_private:
+            skipped.append((username, "private profile"))
+            continue
+        public.append(username)
+    return public, skipped
 
 
 def is_video_file(path: Path) -> bool:
@@ -462,13 +1012,64 @@ def print_cmd(cmd: list[str]) -> None:
     print(f"$ {pretty}")
 
 
-def run_instaloader(cmd: list[str], dry_run: bool = False) -> None:
+def run_instaloader(
+    cmd: list[str],
+    dry_run: bool = False,
+    *,
+    retries: int = 0,
+    retry_wait_seconds: float = 180.0,
+    retry_backoff: float = 1.5,
+) -> None:
     print_cmd(cmd)
     if dry_run:
         return
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
-        raise SystemExit(result.returncode)
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(cmd, check=False)
+        if result.returncode == 0:
+            return
+        if attempt == attempts:
+            raise SystemExit(result.returncode)
+        wait_seconds = max(1.0, retry_wait_seconds) * (
+            max(1.0, retry_backoff) ** (attempt - 1)
+        )
+        wait_label = f"{wait_seconds:.1f}".rstrip("0").rstrip(".")
+        print(
+            "Instaloader exited with "
+            f"{result.returncode}. Temporary Instagram throttling often looks like "
+            '"Please wait a few minutes before you try again." '
+            f"Retrying in {wait_label}s (attempt {attempt + 1}/{attempts})..."
+        )
+        time.sleep(wait_seconds)
+        print_cmd(cmd)
+
+
+def run_instaloader_per_target(
+    base_cmd: list[str],
+    targets: list[str],
+    *,
+    dry_run: bool = False,
+    retries: int = 0,
+    retry_wait_seconds: float = 180.0,
+    retry_backoff: float = 1.5,
+) -> tuple[int, int]:
+    succeeded = 0
+    failed = 0
+    for target in targets:
+        cmd = [*base_cmd, target]
+        try:
+            run_instaloader(
+                cmd,
+                dry_run=dry_run,
+                retries=retries,
+                retry_wait_seconds=retry_wait_seconds,
+                retry_backoff=retry_backoff,
+            )
+            succeeded += 1
+        except SystemExit as exc:
+            failed += 1
+            print(f"Skipping target {target!r}; Instaloader exited with {exc.code}.")
+    return succeeded, failed
 
 
 def add_auth_flags(cmd: list[str], username: str | None, session_file: Path | None) -> None:
@@ -485,9 +1086,10 @@ def build_common_download_cmd(
     session_file: Path | None,
     dirname_pattern: str,
     quiet: bool,
+    abort_on_401: bool,
 ) -> list[str]:
     cmd = [
-        "instaloader",
+        *resolve_instaloader_cmd(),
         "--dirname-pattern",
         dirname_pattern,
         "--filename-pattern",
@@ -497,16 +1099,89 @@ def build_common_download_cmd(
     add_auth_flags(cmd, username, session_file)
     if quiet:
         cmd.append("--quiet")
+    if abort_on_401:
+        cmd.extend(["--abort-on", "401"])
     return cmd
 
 
 def command_login(args: argparse.Namespace) -> None:
     args.session_file.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["instaloader", "--login", args.username, "--sessionfile", str(args.session_file)]
+    cmd = [
+        *resolve_instaloader_cmd(),
+        "--login",
+        args.username,
+        "--sessionfile",
+        str(args.session_file),
+    ]
     if args.quiet:
         cmd.append("--quiet")
-    run_instaloader(cmd, dry_run=args.dry_run)
+    run_instaloader(
+        cmd,
+        dry_run=args.dry_run,
+        retries=args.instaloader_retries,
+        retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        retry_backoff=args.instaloader_retry_backoff,
+    )
+    ok, reason = session_has_non_empty_sessionid(args.session_file)
+    if ok:
+        print(f"Session file configured at {args.session_file}")
+        return
     print(f"Session file configured at {args.session_file}")
+    print(
+        "Warning: session file still appears invalid for GraphQL use "
+        f"({reason}). Try refreshing from browser cookies:\n"
+        f"  python scripts/ig_pipeline.py session-from-browser --username {args.username}"
+    )
+
+
+def command_session_status(args: argparse.Namespace) -> None:
+    cookies, err = load_session_cookie_dict(args.session_file)
+    if cookies is None:
+        print(f"Session status: invalid ({err})")
+        raise SystemExit(1)
+    sessionid = cookies.get("sessionid")
+    csrftoken = cookies.get("csrftoken")
+    ds_user_id = cookies.get("ds_user_id")
+    keys = sorted(cookies.keys())
+    print(f"Session file: {args.session_file}")
+    print(f"Cookie keys: {', '.join(keys)}")
+    print(f"sessionid: {cookie_preview(sessionid)}")
+    print(f"csrftoken: {cookie_preview(csrftoken)}")
+    print(f"ds_user_id: {ds_user_id if isinstance(ds_user_id, str) and ds_user_id else '<missing>'}")
+    ok, reason = session_has_non_empty_sessionid(args.session_file)
+    if ok:
+        print("Session status: usable")
+        return
+    print(f"Session status: invalid ({reason})")
+    raise SystemExit(1)
+
+
+def command_session_from_browser(args: argparse.Namespace) -> None:
+    if args.dry_run:
+        print(
+            f"Would import instagram.com cookies from browser={args.browser!r} "
+            f"into session file {args.session_file}"
+        )
+        return
+    args.session_file.parent.mkdir(parents=True, exist_ok=True)
+    cookies = load_instagram_cookies_from_browser(args.browser)
+    if not cookies:
+        raise SystemExit(
+            f"No instagram.com cookies found in {args.browser}. "
+            "Open instagram.com in that browser and log in first."
+        )
+    args.session_file.write_bytes(pickle.dumps(cookies))
+    ok, reason = session_has_non_empty_sessionid(args.session_file)
+    if not ok:
+        raise SystemExit(
+            "Browser cookie import completed, but session is still invalid "
+            f"({reason}). Make sure you are logged into instagram.com in the selected browser/profile, "
+            "then rerun this command."
+        )
+    print(
+        f"Session refreshed from {args.browser} cookies: {args.session_file} "
+        f"(sessionid={cookie_preview(cookies.get('sessionid'))})"
+    )
 
 
 def command_sync_profiles(args: argparse.Namespace) -> None:
@@ -519,6 +1194,7 @@ def command_sync_profiles(args: argparse.Namespace) -> None:
         print(f"No profiles found in {args.profiles_file}")
         return
 
+    warn_if_session_lacks_sessionid(args.username, args.session_file)
     args.download_root.mkdir(parents=True, exist_ok=True)
     args.latest_stamps.parent.mkdir(parents=True, exist_ok=True)
 
@@ -527,6 +1203,7 @@ def command_sync_profiles(args: argparse.Namespace) -> None:
         session_file=args.session_file,
         dirname_pattern=str(args.download_root / "{target}"),
         quiet=args.quiet,
+        abort_on_401=args.abort_on_401,
     )
     cmd.extend(["--latest-stamps", str(args.latest_stamps)])
     if args.fast_update:
@@ -536,16 +1213,28 @@ def command_sync_profiles(args: argparse.Namespace) -> None:
     else:
         cmd.extend(["--reels", "--no-posts"])
     cmd.extend(profiles)
-    run_instaloader(cmd, dry_run=args.dry_run)
+    run_instaloader(
+        cmd,
+        dry_run=args.dry_run,
+        retries=args.instaloader_retries,
+        retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        retry_backoff=args.instaloader_retry_backoff,
+    )
 
 
 def command_sync_following(args: argparse.Namespace) -> None:
-    if not args.username:
-        raise SystemExit("--username is required for sync-following.")
-
-    seed_profile = normalize_profile(args.seed_profile)
-    if not seed_profile:
-        raise SystemExit("--seed-profile must be a valid Instagram username.")
+    target_mode = args.target_mode
+    if target_mode not in {"following", "feed", "public-candidates"}:
+        raise SystemExit("--target-mode must be one of: following, feed, public-candidates.")
+    if target_mode in {"following", "feed"} and not args.username:
+        raise SystemExit("--username is required for --target-mode following/feed.")
+    seed_profile: str | None = None
+    if target_mode in {"following", "public-candidates"}:
+        seed_profile = normalize_profile(args.seed_profile)
+        if not seed_profile or not is_valid_username(seed_profile):
+            raise SystemExit("--seed-profile must be a valid Instagram username.")
+    elif args.feed_count is not None and args.feed_count <= 0:
+        raise SystemExit("--feed-count must be > 0 when provided.")
     if args.max_age_days < 0:
         raise SystemExit("--max-age-days must be >= 0.")
 
@@ -555,11 +1244,84 @@ def command_sync_following(args: argparse.Namespace) -> None:
     max_age_seconds = args.max_age_days * 24 * 60 * 60
     min_unix_ts = int((datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)).timestamp())
 
+    username: str | None = args.username
+    session_file: Path | None = args.session_file
+    if target_mode == "public-candidates":
+        if username:
+            print(
+                "Public-candidates mode runs anonymously; ignoring --username and --session-file."
+            )
+        username = None
+        session_file = None
+    warn_if_session_lacks_sessionid(username, session_file)
+    if args.stop_when_older and target_mode in {"following", "public-candidates"}:
+        if args.dry_run:
+            print(
+                "Dry-run: stop-when-older mode uses programmatic Instaloader sync. "
+                "No network requests were made."
+            )
+            return
+        if target_mode == "following":
+            if not username or not session_file:
+                raise SystemExit("--username and --session-file are required for following mode.")
+            print(f"Resolving followees of {seed_profile}...")
+            target_usernames = resolve_followee_usernames(
+                seed_profile=seed_profile or "",
+                username=username,
+                session_file=session_file,
+                quiet=args.quiet,
+                abort_on_401=args.abort_on_401,
+                retries=args.instaloader_retries,
+                retry_wait_seconds=args.instaloader_retry_wait_seconds,
+                retry_backoff=args.instaloader_retry_backoff,
+            )
+            if not target_usernames:
+                print(f"No followees found for {seed_profile}.")
+                return
+        else:
+            candidates_file = args.public_candidates_file
+            if not candidates_file.exists():
+                print(
+                    f"{candidates_file} not found. Scraping only seed profile {seed_profile!r}. "
+                    "Create this file to add candidate followees."
+                )
+            candidates, invalid = collect_public_candidates(seed_profile or "", candidates_file)
+            for bad in invalid:
+                print(f"Skipping invalid candidate profile: {bad}")
+            if not candidates:
+                print("No valid public-candidate profiles to process.")
+                return
+            target_usernames, skipped = classify_public_candidates(candidates)
+            for username_value, reason in skipped:
+                print(f"Skipping {username_value!r}: {reason}.")
+            if not target_usernames:
+                print("No public candidate profiles left after visibility checks.")
+                return
+        download_profiles_with_age_cutoff(
+            target_usernames=target_usernames,
+            download_root=args.download_root,
+            latest_stamps_file=args.latest_stamps,
+            max_age_days=args.max_age_days,
+            reels_only=args.reels_only,
+            fast_update=args.fast_update,
+            possibly_pinned=args.possibly_pinned,
+            min_old_posts_before_stop=args.min_old_posts_before_stop,
+            username=username,
+            session_file=session_file,
+            quiet=args.quiet,
+            abort_on_401=args.abort_on_401,
+            retries=args.instaloader_retries,
+            retry_wait_seconds=args.instaloader_retry_wait_seconds,
+            retry_backoff=args.instaloader_retry_backoff,
+        )
+        return
+
     cmd = build_common_download_cmd(
-        username=args.username,
-        session_file=args.session_file,
+        username=username,
+        session_file=session_file,
         dirname_pattern=str(args.download_root / "{target}"),
         quiet=args.quiet,
+        abort_on_401=args.abort_on_401,
     )
     cmd.extend(
         [
@@ -576,8 +1338,61 @@ def command_sync_following(args: argparse.Namespace) -> None:
         cmd.extend(["--reels", "--no-posts"])
     else:
         cmd.append("--reels")
-    cmd.append(f"@{seed_profile}")
-    run_instaloader(cmd, dry_run=args.dry_run)
+    if target_mode == "following":
+        cmd.append(f"@{seed_profile}")
+        run_instaloader(
+            cmd,
+            dry_run=args.dry_run,
+            retries=args.instaloader_retries,
+            retry_wait_seconds=args.instaloader_retry_wait_seconds,
+            retry_backoff=args.instaloader_retry_backoff,
+        )
+        return
+    if target_mode == "feed":
+        if args.feed_count is not None:
+            cmd.extend(["--count", str(args.feed_count)])
+        cmd.append(":feed")
+        run_instaloader(
+            cmd,
+            dry_run=args.dry_run,
+            retries=args.instaloader_retries,
+            retry_wait_seconds=args.instaloader_retry_wait_seconds,
+            retry_backoff=args.instaloader_retry_backoff,
+        )
+        return
+
+    candidates_file = args.public_candidates_file
+    if not candidates_file.exists():
+        print(
+            f"{candidates_file} not found. Scraping only seed profile {seed_profile!r}. "
+            "Create this file to add candidate followees."
+        )
+    candidates, invalid = collect_public_candidates(seed_profile or "", candidates_file)
+    for bad in invalid:
+        print(f"Skipping invalid candidate profile: {bad}")
+    if not candidates:
+        print("No valid public-candidate profiles to process.")
+        return
+
+    public_candidates, skipped = classify_public_candidates(candidates)
+    for username_value, reason in skipped:
+        print(f"Skipping {username_value!r}: {reason}.")
+    if not public_candidates:
+        print("No public candidate profiles left after visibility checks.")
+        return
+
+    succeeded, failed = run_instaloader_per_target(
+        cmd,
+        public_candidates,
+        dry_run=args.dry_run,
+        retries=args.instaloader_retries,
+        retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        retry_backoff=args.instaloader_retry_backoff,
+    )
+    print(
+        f"Public-candidates sync complete. targets_total={len(public_candidates)}, "
+        f"succeeded={succeeded}, failed={failed}"
+    )
 
 
 def command_download_links(args: argparse.Namespace) -> None:
@@ -592,6 +1407,7 @@ def command_download_links(args: argparse.Namespace) -> None:
         print(f"No valid links found in {args.links_file}")
         return
 
+    warn_if_session_lacks_sessionid(args.username, args.session_file)
     links_root = args.download_root / "links"
     links_root.mkdir(parents=True, exist_ok=True)
 
@@ -600,10 +1416,17 @@ def command_download_links(args: argparse.Namespace) -> None:
         session_file=args.session_file,
         dirname_pattern=str(links_root / "{target}"),
         quiet=args.quiet,
+        abort_on_401=args.abort_on_401,
     )
     cmd.append("--")
     cmd.extend([f"-{code}" for code in shortcodes])
-    run_instaloader(cmd, dry_run=args.dry_run)
+    run_instaloader(
+        cmd,
+        dry_run=args.dry_run,
+        retries=args.instaloader_retries,
+        retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        retry_backoff=args.instaloader_retry_backoff,
+    )
 
 
 def command_enrich_media(args: argparse.Namespace) -> None:
@@ -730,6 +1553,16 @@ def command_run_following(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         fast_update=args.fast_update,
         reels_only=args.reels_only,
+        target_mode=args.target_mode,
+        feed_count=args.feed_count,
+        stop_when_older=args.stop_when_older,
+        possibly_pinned=args.possibly_pinned,
+        min_old_posts_before_stop=args.min_old_posts_before_stop,
+        public_candidates_file=args.public_candidates_file,
+        instaloader_retries=args.instaloader_retries,
+        instaloader_retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        instaloader_retry_backoff=args.instaloader_retry_backoff,
+        abort_on_401=args.abort_on_401,
     )
     command_sync_following(sync_args)
     if args.dry_run:
@@ -764,6 +1597,10 @@ def command_run(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         fast_update=args.fast_update,
         include_posts=args.include_posts,
+        instaloader_retries=args.instaloader_retries,
+        instaloader_retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        instaloader_retry_backoff=args.instaloader_retry_backoff,
+        abort_on_401=args.abort_on_401,
     )
     links_args = argparse.Namespace(
         username=args.username,
@@ -772,6 +1609,10 @@ def command_run(args: argparse.Namespace) -> None:
         download_root=args.download_root,
         quiet=args.quiet,
         dry_run=args.dry_run,
+        instaloader_retries=args.instaloader_retries,
+        instaloader_retry_wait_seconds=args.instaloader_retry_wait_seconds,
+        instaloader_retry_backoff=args.instaloader_retry_backoff,
+        abort_on_401=args.abort_on_401,
     )
     command_sync_profiles(sync_args)
     command_download_links(links_args)
@@ -804,6 +1645,51 @@ def add_auth_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_dry_run_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running.")
+
+
+def add_instaloader_resilience_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    default_retries: int = 2,
+    include_abort_on_401: bool = True,
+) -> None:
+    parser.add_argument(
+        "--instaloader-retries",
+        type=int,
+        default=env_int("IG_INSTALOADER_RETRIES", default_retries),
+        help=(
+            "How many times to retry failed Instaloader runs. "
+            "Falls back to IG_INSTALOADER_RETRIES env var."
+        ),
+    )
+    parser.add_argument(
+        "--instaloader-retry-wait-seconds",
+        type=float,
+        default=env_float("IG_INSTALOADER_RETRY_WAIT_SECONDS", 180.0),
+        help=(
+            "Base delay before retrying failed Instaloader runs. "
+            "Falls back to IG_INSTALOADER_RETRY_WAIT_SECONDS env var."
+        ),
+    )
+    parser.add_argument(
+        "--instaloader-retry-backoff",
+        type=float,
+        default=env_float("IG_INSTALOADER_RETRY_BACKOFF", 1.5),
+        help=(
+            "Multiplier applied between retry waits. "
+            "Falls back to IG_INSTALOADER_RETRY_BACKOFF env var."
+        ),
+    )
+    if include_abort_on_401:
+        parser.add_argument(
+            "--abort-on-401",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Pass --abort-on 401 to Instaloader so temporary blocks fail fast "
+                "and retry logic can take over."
+            ),
+        )
 
 
 def add_following_arguments(parser: argparse.ArgumentParser) -> None:
@@ -845,6 +1731,61 @@ def add_following_arguments(parser: argparse.ArgumentParser) -> None:
         "--reels-only",
         action="store_true",
         help="Scrape reels only. By default, both regular posts and reels are scraped.",
+    )
+    parser.add_argument(
+        "--target-mode",
+        choices=["following", "feed", "public-candidates"],
+        default=os.getenv("IG_TARGET_MODE", "following"),
+        help=(
+            "Data source to scrape: 'following' uses @seed-profile (all followees, login), "
+            "'feed' scrapes your own account feed (login), "
+            "'public-candidates' runs anonymously from seed + candidates file."
+        ),
+    )
+    parser.add_argument(
+        "--feed-count",
+        type=int,
+        default=env_int("IG_FEED_COUNT", 80),
+        help=(
+            "When --target-mode=feed, maximum number of feed posts to inspect. "
+            "Falls back to IG_FEED_COUNT env var."
+        ),
+    )
+    parser.add_argument(
+        "--stop-when-older",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For following/public-candidates mode, stop scanning each profile once posts are "
+            "older than --max-age-days (avoids long runs full of skips)."
+        ),
+    )
+    parser.add_argument(
+        "--possibly-pinned",
+        type=int,
+        default=env_int("IG_POSSIBLY_PINNED", 5),
+        help=(
+            "How many top posts to treat as possibly pinned when deciding to stop (default: 5). "
+            "Pinned posts can be old and appear before recent posts."
+        ),
+    )
+    parser.add_argument(
+        "--min-old-posts-before-stop",
+        type=int,
+        default=env_int("IG_MIN_OLD_POSTS_BEFORE_STOP", 5),
+        help=(
+            "When --stop-when-older is enabled, require this many consecutive old posts "
+            "before stopping (default: 5). This helps avoid stopping early due to pinned/out-of-order posts."
+        ),
+    )
+    parser.add_argument(
+        "--public-candidates-file",
+        type=Path,
+        default=Path(os.getenv("IG_PUBLIC_CANDIDATES_FILE", "config/public_following_candidates.txt")),
+        help=(
+            "When --target-mode=public-candidates, file with one candidate profile per line "
+            "(username or profile URL)."
+        ),
     )
 
 
@@ -909,14 +1850,53 @@ def create_cli() -> argparse.ArgumentParser:
         help="Path to write the session file.",
     )
     login_parser.add_argument("--quiet", action="store_true", help="Reduce Instaloader output.")
+    add_instaloader_resilience_arguments(
+        login_parser, default_retries=0, include_abort_on_401=False
+    )
     add_dry_run_argument(login_parser)
     login_parser.set_defaults(handler=command_login)
+
+    session_status_parser = subparsers.add_parser(
+        "session-status", help="Inspect local Instaloader session health."
+    )
+    session_status_parser.add_argument(
+        "--session-file",
+        type=Path,
+        default=Path(".secrets/instagram.session"),
+        help="Session file to inspect.",
+    )
+    session_status_parser.set_defaults(handler=command_session_status)
+
+    session_from_browser_parser = subparsers.add_parser(
+        "session-from-browser",
+        help="Import logged-in browser cookies into local Instaloader session file.",
+    )
+    session_from_browser_parser.add_argument(
+        "--username",
+        default=os.getenv("IG_USERNAME"),
+        required=os.getenv("IG_USERNAME") is None,
+        help="Instagram username for the resulting session file.",
+    )
+    session_from_browser_parser.add_argument(
+        "--browser",
+        default=os.getenv("IG_COOKIE_BROWSER", "Firefox"),
+        help="Browser name for --load-cookies (example: Firefox, LibreWolf, Chrome).",
+    )
+    session_from_browser_parser.add_argument(
+        "--session-file",
+        type=Path,
+        default=Path(".secrets/instagram.session"),
+        help="Path to write refreshed session file.",
+    )
+    add_dry_run_argument(session_from_browser_parser)
+    session_from_browser_parser.set_defaults(handler=command_session_from_browser)
 
     sync_parser = subparsers.add_parser(
         "sync-profiles", help="Download new content for profiles in config/profiles.txt."
     )
     add_auth_arguments(sync_parser)
     add_profile_arguments(sync_parser)
+    add_instaloader_resilience_arguments(sync_parser)
     add_dry_run_argument(sync_parser)
     sync_parser.set_defaults(handler=command_sync_profiles)
 
@@ -926,6 +1906,7 @@ def create_cli() -> argparse.ArgumentParser:
     )
     add_auth_arguments(following_parser)
     add_following_arguments(following_parser)
+    add_instaloader_resilience_arguments(following_parser)
     add_dry_run_argument(following_parser)
     following_parser.set_defaults(handler=command_sync_following)
 
@@ -1012,6 +1993,7 @@ def create_cli() -> argparse.ArgumentParser:
     )
     add_auth_arguments(run_following_parser)
     add_following_arguments(run_following_parser)
+    add_instaloader_resilience_arguments(run_following_parser)
     run_following_parser.add_argument(
         "--output-root",
         type=Path,
@@ -1082,6 +2064,7 @@ def create_cli() -> argparse.ArgumentParser:
     )
     add_auth_arguments(links_parser)
     add_link_arguments(links_parser)
+    add_instaloader_resilience_arguments(links_parser)
     add_dry_run_argument(links_parser)
     links_parser.set_defaults(handler=command_download_links)
 
@@ -1090,6 +2073,7 @@ def create_cli() -> argparse.ArgumentParser:
     )
     add_auth_arguments(run_parser)
     add_profile_arguments(run_parser)
+    add_instaloader_resilience_arguments(run_parser)
     run_parser.add_argument(
         "--links-file",
         type=Path,
@@ -1108,6 +2092,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.command in {
         "login",
+        "session-from-browser",
         "sync-profiles",
         "sync-following",
         "download-links",

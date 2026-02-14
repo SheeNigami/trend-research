@@ -41,7 +41,7 @@ This creates `.secrets/instagram.session` (already gitignored).
 python scripts/ig_pipeline.py run-following \
   --username YOUR_IG_USERNAME \
   --seed-profile PROFILE_OR_URL \
-  --max-age-days 14
+  --max-age-days 30
 ```
 
 ### Option B: set defaults in `.env` and run shorter command
@@ -56,8 +56,15 @@ Edit `.env`:
 
 ```env
 IG_USERNAME=your_instagram_username
+IG_COOKIE_BROWSER=Chrome
 IG_SEED_PROFILE=natgeo
-IG_MAX_AGE_DAYS=14
+IG_MAX_AGE_DAYS=30
+IG_TARGET_MODE=following
+IG_FEED_COUNT=80
+IG_PUBLIC_CANDIDATES_FILE=config/public_following_candidates.txt
+IG_INSTALOADER_RETRIES=2
+IG_INSTALOADER_RETRY_WAIT_SECONDS=180
+IG_INSTALOADER_RETRY_BACKOFF=1.5
 ```
 
 Then run:
@@ -71,6 +78,19 @@ Or:
 ```bash
 make run-following
 ```
+
+## 3.1 Browser-based session refresh (recommended for login issues)
+
+If login repeatedly returns `401` / `Please wait a few minutes...`, refresh session
+from browser cookies:
+
+```bash
+pip install "instaloader[browser-cookie3]"
+python scripts/ig_pipeline.py session-from-browser --username YOUR_IG_USERNAME --browser Chrome
+python scripts/ig_pipeline.py session-status
+```
+
+If `session-status` reports `usable`, retry your login-required mode.
 
 ## 4. What gets collected
 
@@ -108,6 +128,16 @@ Global catalog:
 `run-following`:
 - `--max-age-days 7` only keep newer content
 - `--reels-only` scrape reels only (default is posts + reels)
+- `--target-mode feed` use your own feed instead of enumerating followees
+- `--feed-count 80` max feed posts to inspect when using `--target-mode feed`
+- `--target-mode public-candidates` no-login mode (seed profile + candidates file)
+- `--stop-when-older` stop scanning each profile once `--max-age-days` is reached (default)
+- `--no-stop-when-older` restore old behavior (`post-filter` + many `skipped` lines)
+- `--public-candidates-file config/public_following_candidates.txt` source for no-login candidates
+- `session-from-browser --browser Chrome` import working browser cookies into session file
+- `session-status` verify local session contains non-empty `sessionid`
+- `--instaloader-retries 3` retry temporary failures (rate limits / transient blocks)
+- `--instaloader-retry-wait-seconds 240` base wait before retry
 - `--no-transcribe` skip Whisper
 - `--no-ocr` skip OCR
 - `--overwrite` regenerate analysis files
@@ -131,7 +161,7 @@ If these are missing, the pipeline still runs and marks that step as skipped in 
 
 Scrape only:
 ```bash
-python scripts/ig_pipeline.py sync-following --seed-profile natgeo --max-age-days 14
+python scripts/ig_pipeline.py sync-following --seed-profile natgeo --max-age-days 30
 ```
 
 Enrich only:
@@ -143,6 +173,9 @@ python scripts/ig_pipeline.py enrich-media --input-root data/instagram/following
 
 - Use this only for content you are authorized to collect and in line with Instagram terms.
 - Keep `.secrets/instagram.session` private.
+- If Instagram returns `Please wait a few minutes before you try again.`, it is a temporary server-side throttle. The pipeline now retries automatically; you can tune retries via the flags/env vars above.
+- If `@seed-profile` keeps failing with 401s, run with `--target-mode feed` as a practical fallback while cooldown clears.
+- Instagram does not expose followee enumeration anonymously. `public-candidates` mode works without login by scraping the public seed profile plus usernames listed in `config/public_following_candidates.txt`, and it auto-skips private accounts.
 
 ## Publish to GitHub
 
