@@ -3,7 +3,7 @@ VENV ?= .venv
 BIN := $(VENV)/bin
 RUN := $(BIN)/python
 
-.PHONY: setup check help run-following sync-following enrich-media session-from-browser session-status
+.PHONY: setup check help run-following sync-following enrich-media session-from-browser session-status dashboard
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -32,3 +32,6 @@ session-from-browser:
 
 session-status:
 	. $(BIN)/activate && $(RUN) scripts/ig_pipeline.py session-status
+
+dashboard:
+	. $(BIN)/activate && streamlit run dashboard/app.py

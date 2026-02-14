@@ -79,6 +79,20 @@ Or:
 make run-following
 ```
 
+## Dashboard
+
+After you have a `data/analysis/catalog.jsonl`, you can run a basic local dashboard:
+
+```bash
+make dashboard
+```
+
+It reads `data/analysis/catalog.jsonl` and visualizes:
+- posts over time
+- most viral posts (likes + 2*comments)
+- top hashtags/mentions/music
+- simple clustering-based “themes” with optional LLM labeling (uses `OPENAI_API_KEY`)
+
 ## 3.1 Browser-based session refresh (recommended for login issues)
 
 If login repeatedly returns `401` / `Please wait a few minutes...`, refresh session
